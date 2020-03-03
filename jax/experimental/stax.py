@@ -21,6 +21,7 @@ For an example of its use, see examples/resnet50.py.
 import functools
 import itertools
 import operator as op
+from functools import partial
 
 import numpy as onp
 
@@ -274,6 +275,188 @@ def Dropout(rate, mode='train'):
       return np.where(keep, inputs / rate, 0)
     else:
       return inputs
+  return init_fun, apply_fun
+
+
+
+def GRUCell(out_dim, W_init=glorot(), b_init=normal()):
+  """ Represents a single recurrent GRU cell"""
+  def init_fun(rng, input_shape):
+    """ Initialize the cell for stax. """
+
+    k1, k2, k3 = random.split(rng, num=3)
+    update_W, update_U, update_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    k1, k2, k3 = random.split(rng, num=3)
+    reset_W, reset_U, reset_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    k1, k2, k3 = random.split(rng, num=3)
+    out_W, out_U, out_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    output_shape = input_shape[:-1] + (out_dim,)
+    return (output_shape,
+            ((update_W, update_U, update_b),
+             (reset_W, reset_U, reset_b),
+             (out_W, out_U, out_b),),)
+
+  def apply_fun(params, hidden, inp):
+    """ Perform single timestep update of the network. """
+    (update_W, update_U, update_b), (reset_W, reset_U, reset_b), (
+        out_W, out_U, out_b) = params
+
+    update_gate = sigmoid(np.dot(inp, update_W) + np.dot(hidden, update_U)
+                          + update_b)
+    reset_gate = sigmoid(np.dot(inp, reset_W) + np.dot(hidden, reset_U)
+                         + reset_b)
+    output_gate = np.tanh(np.dot(inp, out_W)
+                          + np.dot(np.multiply(reset_gate, hidden), out_U)
+                          + out_b)
+    hidden = np.multiply(update_gate, hidden) + np.multiply(1-update_gate,
+                                                            output_gate)
+    output = hidden
+    return hidden, output
+
+  return init_fun, apply_fun
+
+def LSTMCell(out_dim, W_init=glorot(), b_init=normal()):
+  """ construction function for single LSTM cell. """
+  def init_fun(rng, input_shape):
+    k1, k2, k3 = random.split(rng, num=3)
+    forget_W, forget_U, forget_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    k1, k2, k3 = random.split(k1, num=3)
+    in_W, in_U, in_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    k1, k2, k3 = random.split(k1, num=3)
+    out_W, out_U, out_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    k1, k2, k3 = random.split(k1, num=3)
+    change_W, change_U, change_b = (
+        W_init(k1, (input_shape[-1], out_dim)),
+        W_init(k2, (out_dim, out_dim)),
+        b_init(k3, (out_dim,)),
+    )
+
+    output_shape = input_shape[:-1] + (out_dim,)
+    return (output_shape,
+            ((forget_W, forget_U, forget_b),
+              (in_W, in_U, in_b),
+              (out_W, out_U, out_b),
+              (change_W, change_U, change_b),),)
+
+  def apply_fun(params, hidden_cell, inp):
+    """ Perform single timestep update of the network. """
+    (forget_W, forget_U, forget_b), (in_W, in_U, in_b), (
+        out_W, out_U, out_b), (change_W, change_U, change_b) = params
+
+    hidden, cell = hidden_cell
+    input_gate = sigmoid(np.dot(inp, in_W) + np.dot(hidden, in_U) + in_b)
+    change_gate = np.tanh(np.dot(inp, change_W) + np.dot(hidden, change_U)
+                          + change_b)
+    forget_gate = sigmoid(np.dot(inp, forget_W) + np.dot(hidden, forget_U)
+                          + forget_b)
+
+    cell = np.multiply(change_gate, input_gate) + np.multiply(cell,
+                                                              forget_gate)
+
+    output_gate = sigmoid(np.dot(inp, out_W)
+                          + np.dot(hidden, out_U) + out_b)
+    output = np.multiply(output_gate, np.tanh(cell))
+    hidden_cell = (hidden, cell)
+    return hidden_cell, output
+
+  return init_fun, apply_fun
+
+def _scan_rnn(scan_fun, params, states, inputs, **kwargs):
+  """
+  recursive scan helper
+
+  states: (batches x state_dim)
+  inputs: (batches x max_sequence_length x state_dim)
+  """
+
+  # swap batch and sequence axis to conform with jax.lax.scan api
+  inputs = np.swapaxes(inputs, 0, 1)
+
+  # apply cell function along sequence axis to update states
+  _, outputs = lax.scan(partial(scan_fun, params, **kwargs), states, inputs)
+
+  # revert batch and sequence axis
+  outputs = np.swapaxes(outputs, 0, 1)
+
+  return outputs
+
+def GRU(out_dim, W_init=glorot(), b_init=normal()):
+  """ Layer construction function for Gated Recurrent Unit (GRU) layer. """
+
+  # construct GRU cell
+  cell_init, cell_apply = GRUCell(out_dim, W_init, b_init)
+
+  def init_fun(rng, input_shape):
+    """ Initialize the GRU layer for stax. """
+    output_shape = input_shape[:-1] + (out_dim,)
+    
+    k1, k2 = random.split(rng)
+    # construct an initial state for each sequence
+    hidden = b_init(k1, (input_shape[0], out_dim))
+    _, cell_params = cell_init(k2, input_shape[1:])
+    return output_shape, (hidden, cell_params)
+
+  def apply_fun(params, inputs, **kwargs):
+    """ Loop over the time steps of the input sequence. """
+    state, cell_params = params
+    outputs = _scan_rnn(cell_apply, cell_params, state, inputs, **kwargs)
+    return outputs
+
+  return init_fun, apply_fun
+
+def LSTM(out_dim, W_init=glorot(), b_init=normal()):
+  """ Layer construction function for Long Short Term Memory (LSTM) layer. """
+
+  # construct LSTM cell
+  cell_init, cell_apply = LSTMCell(out_dim, W_init, b_init)
+
+  def init_fun(rng, input_shape):
+    """ Initialize the LSTM layer for stax. """
+    output_shape = input_shape[:-1] + (out_dim,)
+
+    k1, k2 = random.split(rng)
+
+    # construct an initial state for each sequence
+    state = (b_init(k1, (input_shape[0], out_dim)), b_init(k2, (input_shape[0], out_dim)))
+    _, cell_params = cell_init(rng, input_shape[1:])
+    return output_shape, (state, cell_params)
+
+  def apply_fun(params, inputs, **kwargs):
+    """ Loop over the time steps of the input sequence. """
+    state, cell_params = params
+    outputs = _scan_rnn(cell_apply, cell_params, state, inputs, **kwargs)
+    return outputs
+
   return init_fun, apply_fun
 
 
